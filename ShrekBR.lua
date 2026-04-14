@@ -4,13 +4,12 @@ local localPlayer = Players.LocalPlayer
 local Mouse = localPlayer:GetMouse()
 local BulletWeapon = require(ReplicatedStorage.WeaponSystem.WeaponType.BulletWeapon)
 local NetworkModule = require(ReplicatedStorage.Network)
-getgenv().MasterConfig = {
-    SilentAim = true,
-    InfiniteAmmo = true,
-    RapidFire = true,
-    Wallbang = true,
-    Visuals = true
-}
+ getgenv().MasterConfig = {
+     SilentAim    =  true,
+       InfiniteAmmo  =  true,
+         RapidFire  =  true,
+           Wallbang  =  true,
+             Visuals  =  true}
 local VECTOR_UP = Vector3.new(0, 1, 0)
 local function getClosestPlayer()
     local closest = nil

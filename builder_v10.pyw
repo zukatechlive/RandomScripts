@@ -17,11 +17,9 @@ import json
 import webview
 
 APP_TITLE   = "Build Doctor"
-APP_VERSION = "8.0"
+APP_VERSION = "9.0"
 
-# ─────────────────────────────────────────────
-# MSVC Detection
-# ─────────────────────────────────────────────
+
 
 # Hardcoded fallback path — used if vswhere auto-detection fails.
 VCVARS64_OVERRIDE = r"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
@@ -318,7 +316,10 @@ PATTERNS = [
     (r"cmake.*is not recognized",   "CMake not found — install CMake and add to PATH."),
     (r"ninja.*is not recognized",   "Ninja not found — install Ninja build system."),
     (r"\bSDL\b",                    "Possible SDL dependency missing — check SDL2 include/lib paths."),
-    (r"openssl",                    "Possible OpenSSL dependency missing."),
+    (r"openssl",                    "OpenSSL dependency missing — click FIX DEPS to install via vcpkg automatically."),
+    (r"ZSTD_decompress|error C3861.*zstd|zstd(?:\.h|/zstd\.h)",
+                                    "ZSTD library missing — click FIX DEPS to install via vcpkg automatically."),
+    (r"warning C4101",              "C4101: unreferenced local variable — click FIX DEPS to suppress automatically."),
     (r"boost",                      "Possible Boost dependency missing — set BOOST_ROOT or add to include paths."),
     (r"error C2065",                "Undeclared identifier — missing include or wrong namespace."),
     (r"error C2664",                "Type mismatch — function argument type error."),
@@ -1810,6 +1811,1004 @@ def fix_all_cs(folder):
 
 
 # ─────────────────────────────────────────────
+# Auto-Fix Pass 9: Missing ClCompile / ClInclude in .vcxproj
+# ─────────────────────────────────────────────
+
+def fix_vcxproj_missing_items(folder):
+    """
+    Scans every .vcxproj under `folder` and compares the files it references
+    against the files that physically exist on disk.
+
+    For EACH .vcxproj this pass will:
+      A) Find every .cpp / .c file on disk (under the project folder) that is
+         NOT already listed as a <ClCompile Include="..."/> entry — and add it.
+      B) Find every .h / .hpp file on disk that is NOT already listed as a
+         <ClInclude Include="..."/> entry — and add it.
+      C) Remove any <ClCompile> or <ClInclude> entries whose path resolves to a
+         file that no longer exists on disk (dead references).
+
+    Skips output/cache directories (x64, x86, Debug, Release, .vs, .git,
+    __pycache__, RelWithDebInfo, MinSizeRel, build, CMakeFiles).
+
+    Returns a list of human-readable action strings.
+    """
+    import xml.etree.ElementTree as ET
+
+    actions = []
+
+    # Directories that are build-output or tooling artefacts — never source
+    _SKIP_DIRS = {
+        "x64", "x86", "debug", "release", "relwithdebinfo", "minsizerel",
+        ".vs", ".git", "__pycache__", "build", "cmake_install",
+        "cmakefiles", "ipch", ".cache",
+    }
+
+    all_vcxproj = []
+    for rootdir, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if d.lower() not in _SKIP_DIRS]
+        for fname in files:
+            if fname.lower().endswith(".vcxproj"):
+                all_vcxproj.append(os.path.join(rootdir, fname))
+
+    if not all_vcxproj:
+        actions.append("[SKIP] No .vcxproj files found under the selected folder.")
+        return actions
+
+    for vcxproj_path in all_vcxproj:
+        proj_dir = os.path.dirname(vcxproj_path)
+        fname    = os.path.basename(vcxproj_path)
+
+        try:
+            tree = ET.parse(vcxproj_path)
+            root = tree.getroot()
+        except ET.ParseError as exc:
+            actions.append(f"[SKIP] {fname}: XML parse error — {exc}")
+            continue
+
+        ns_m  = re.match(r"^\{(.*?)\}", root.tag)
+        xmlns = ns_m.group(1) if ns_m else ""
+
+        def _tag(name):
+            return f"{{{xmlns}}}{name}" if xmlns else name
+
+        def _strip(tag):
+            return re.sub(r"^\{.*?\}", "", tag)
+
+        # ── Collect what the project already references ───────────────────────
+        # Normalised absolute paths already in the project file
+        existing_compile  = {}   # norm_abs_lower -> element
+        existing_include  = {}   # norm_abs_lower -> element
+        dead_compile      = []   # (parent_ig, element, display_path)
+        dead_include      = []
+
+        for ig in root.iter(_tag("ItemGroup")):
+            for child in list(ig):
+                tag_local = _strip(child.tag)
+                inc_attr  = child.attrib.get("Include", "")
+                if not inc_attr:
+                    continue
+                abs_path  = os.path.normpath(
+                    os.path.join(proj_dir, inc_attr.replace("/", os.sep))
+                )
+                norm      = abs_path.lower()
+                if tag_local == "ClCompile":
+                    if os.path.isfile(abs_path):
+                        existing_compile[norm] = child
+                    else:
+                        dead_compile.append((ig, child, inc_attr))
+                elif tag_local == "ClInclude":
+                    if os.path.isfile(abs_path):
+                        existing_include[norm] = child
+                    else:
+                        dead_include.append((ig, child, inc_attr))
+
+        # ── Walk disk for all source/header files ─────────────────────────────
+        disk_sources  = {}   # norm_abs_lower -> abs_path
+        disk_headers  = {}
+
+        for rootdir2, dirs2, files2 in os.walk(proj_dir):
+            dirs2[:] = [d for d in dirs2 if d.lower() not in _SKIP_DIRS]
+            for f in files2:
+                abs_f = os.path.join(rootdir2, f)
+                norm  = abs_f.lower()
+                lo    = f.lower()
+                if lo.endswith((".cpp", ".c", ".cxx", ".cc")):
+                    disk_sources[norm] = abs_f
+                elif lo.endswith((".h", ".hpp", ".hxx", ".hh")):
+                    disk_headers[norm] = abs_f
+
+        # ── Compute what needs to be added ────────────────────────────────────
+        missing_sources = {
+            n: p for n, p in disk_sources.items()
+            if n not in existing_compile
+        }
+        missing_headers = {
+            n: p for n, p in disk_headers.items()
+            if n not in existing_include
+        }
+
+        changed = False
+
+        # ── A) Remove dead <ClCompile> entries ────────────────────────────────
+        for ig, child, disp in dead_compile:
+            ig.remove(child)
+            changed = True
+            actions.append(f"[FIXED-DEAD] {fname}: removed dead <ClCompile Include=\"{disp}\" />")
+
+        # ── B) Remove dead <ClInclude> entries ────────────────────────────────
+        for ig, child, disp in dead_include:
+            ig.remove(child)
+            changed = True
+            actions.append(f"[FIXED-DEAD] {fname}: removed dead <ClInclude Include=\"{disp}\" />")
+
+        # ── C) Add missing <ClCompile> entries ────────────────────────────────
+        if missing_sources:
+            # Find existing ClCompile ItemGroup or create one
+            src_ig = None
+            for ig in root.iter(_tag("ItemGroup")):
+                for child in ig:
+                    if _strip(child.tag) == "ClCompile":
+                        src_ig = ig
+                        break
+                if src_ig is not None:
+                    break
+            if src_ig is None:
+                src_ig = ET.SubElement(root, _tag("ItemGroup"))
+
+            for norm, abs_p in sorted(missing_sources.items()):
+                try:
+                    rel = os.path.relpath(abs_p, proj_dir)
+                except ValueError:
+                    rel = abs_p   # different drive — keep absolute
+                el = ET.SubElement(src_ig, _tag("ClCompile"))
+                el.set("Include", rel)
+                changed = True
+                actions.append(f"[FIXED-ADD] {fname}: added <ClCompile Include=\"{rel}\" />")
+
+        # ── D) Add missing <ClInclude> entries ────────────────────────────────
+        if missing_headers:
+            # Find existing ClInclude ItemGroup or create one
+            hdr_ig = None
+            for ig in root.iter(_tag("ItemGroup")):
+                for child in ig:
+                    if _strip(child.tag) == "ClInclude":
+                        hdr_ig = ig
+                        break
+                if hdr_ig is not None:
+                    break
+            if hdr_ig is None:
+                hdr_ig = ET.SubElement(root, _tag("ItemGroup"))
+
+            for norm, abs_p in sorted(missing_headers.items()):
+                try:
+                    rel = os.path.relpath(abs_p, proj_dir)
+                except ValueError:
+                    rel = abs_p
+                el = ET.SubElement(hdr_ig, _tag("ClInclude"))
+                el.set("Include", rel)
+                changed = True
+                actions.append(f"[FIXED-ADD] {fname}: added <ClInclude Include=\"{rel}\" />")
+
+        # ── Write back if modified ────────────────────────────────────────────
+        if changed:
+            if xmlns:
+                ET.register_namespace("", xmlns)
+            tree.write(vcxproj_path, encoding="utf-8", xml_declaration=True)
+        else:
+            total = len(existing_compile) + len(existing_include)
+            actions.append(
+                f"[OK] {fname}: all {total} source/header reference(s) already present and valid."
+            )
+
+    return actions
+
+
+# ─────────────────────────────────────────────
+# Auto-Fix Pass 10: Missing .lib Files (LNK2001/LNK2019/LNK1181)
+# ─────────────────────────────────────────────
+
+def fix_missing_libs(folder, last_build_output=""):
+    """
+    Scans build output for LNK2001/LNK2019/LNK1181 unresolved symbol errors,
+    attempts to find matching .lib files anywhere in the project tree or common
+    SDK locations, and injects them into AdditionalDependencies / AdditionalLibraryDirectories
+    in every .vcxproj found.
+
+    Also does a blanket scan: any .lib found under the project folder whose
+    directory is not already in the vcxproj lib paths gets added.
+
+    Returns a list of action strings.
+    """
+    import xml.etree.ElementTree as ET
+
+    actions = []
+
+    # ── Step 1: extract referenced symbol names from LNK errors ──────────────
+    # LNK2001/LNK2019: "unresolved external symbol __imp_SomeFunc"
+    # LNK1181: "cannot open input file 'foo.lib'"
+    lnk_sym_pat   = re.compile(r"(?:LNK2001|LNK2019)[^\n]*?symbol\s+\"([^\"]+)\"", re.IGNORECASE)
+    lnk1181_pat   = re.compile(r"LNK1181[^\n]*?'([^']+\.lib)'", re.IGNORECASE)
+    lnk_open_pat  = re.compile(r"cannot open file[^\n]*?'([^']+\.lib)'", re.IGNORECASE)
+
+    explicit_libs = set()   # .lib filenames named directly in errors
+    for m in lnk1181_pat.finditer(last_build_output):
+        explicit_libs.add(os.path.basename(m.group(1)).lower())
+    for m in lnk_open_pat.finditer(last_build_output):
+        explicit_libs.add(os.path.basename(m.group(1)).lower())
+
+    has_lnk = bool(
+        re.search(r"LNK2001|LNK2019|LNK1181|LNK1120|LNK1104", last_build_output, re.IGNORECASE)
+    )
+
+    if not has_lnk and not last_build_output:
+        actions.append("[INFO] No LNK errors detected — running blanket .lib scan instead.")
+    elif not has_lnk:
+        actions.append("[INFO] No LNK errors found in last build output.")
+        return actions
+
+    if explicit_libs:
+        actions.append(f"[INFO] Libs named in errors: {', '.join(sorted(explicit_libs))}")
+
+    # ── Step 2: find all .vcxproj ────────────────────────────────────────────
+    all_vcxproj = []
+    for rootdir, _, files in os.walk(folder):
+        for fname in files:
+            if fname.lower().endswith(".vcxproj"):
+                all_vcxproj.append(os.path.join(rootdir, fname))
+
+    if not all_vcxproj:
+        actions.append("[SKIP] No .vcxproj files found.")
+        return actions
+
+    # ── Step 3: build map of all .lib files in the project tree ──────────────
+    _SKIP_DIRS = {"x64", "x86", "debug", "release", ".git", ".vs",
+                  "__pycache__", "relwithdebinfo", "minsizerel"}
+    lib_dir_map  = {}   # libname.lower() -> set of abs dir paths
+    for rootdir, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if d.lower() not in _SKIP_DIRS]
+        for f in files:
+            if f.lower().endswith(".lib"):
+                lib_dir_map.setdefault(f.lower(), set()).add(rootdir)
+
+    # Also search common Windows SDK / VC lib paths
+    sdk_lib_roots = []
+    for env in ("ProgramFiles", "ProgramFiles(x86)"):
+        pf = os.environ.get(env, "")
+        if pf:
+            sdk_lib_roots += [
+                os.path.join(pf, "Windows Kits", "10", "Lib"),
+                os.path.join(pf, "Microsoft Visual Studio"),
+            ]
+    for root in sdk_lib_roots:
+        if not os.path.isdir(root):
+            continue
+        for rootdir, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d.lower() not in _SKIP_DIRS]
+            for f in files:
+                if f.lower().endswith(".lib"):
+                    lib_dir_map.setdefault(f.lower(), set()).add(rootdir)
+
+    # ── Step 4: resolve directories to inject ────────────────────────────────
+    needed_lib_dirs  = set()
+    needed_lib_names = set()
+
+    if explicit_libs:
+        for lname in explicit_libs:
+            found = lib_dir_map.get(lname, set())
+            if found:
+                for d in found:
+                    needed_lib_dirs.add(d)
+                    needed_lib_names.add(lname)
+                    actions.append(f"[FOUND] '{lname}' → {d}")
+            else:
+                actions.append(f"[WARN] '{lname}' not found in project tree or SDK paths.")
+    else:
+        # Blanket: collect every dir that has .lib files under the project folder
+        for dirs in lib_dir_map.values():
+            for d in dirs:
+                if d.startswith(folder):
+                    needed_lib_dirs.add(d)
+
+    if not needed_lib_dirs:
+        actions.append("[OK] No new lib directories to inject.")
+        return actions
+
+    # ── Step 5: patch each .vcxproj ──────────────────────────────────────────
+    for vcxproj_path in all_vcxproj:
+        proj_dir = os.path.dirname(vcxproj_path)
+        fname    = os.path.basename(vcxproj_path)
+
+        try:
+            tree = ET.parse(vcxproj_path)
+            root = tree.getroot()
+        except ET.ParseError as exc:
+            actions.append(f"[SKIP] {fname}: XML parse error — {exc}")
+            continue
+
+        ns_m  = re.match(r"^\{(.*?)\}", root.tag)
+        xmlns = ns_m.group(1) if ns_m else ""
+
+        def _t(name):
+            return f"{{{xmlns}}}{name}" if xmlns else name
+
+        # Gather existing lib dirs
+        existing_lib_dirs = set()
+        for el in root.iter(_t("AdditionalLibraryDirectories")):
+            for part in re.split(r"[;,]", el.text or ""):
+                part = part.strip()
+                if part and "%" not in part:
+                    existing_lib_dirs.add(
+                        os.path.normpath(os.path.join(proj_dir, part)).lower()
+                    )
+
+        new_lib_rels = []
+        for d in sorted(needed_lib_dirs):
+            norm = os.path.normpath(d).lower()
+            if norm not in existing_lib_dirs:
+                try:
+                    rel = os.path.relpath(d, proj_dir)
+                except ValueError:
+                    rel = d
+                new_lib_rels.append(rel)
+                existing_lib_dirs.add(norm)
+
+        # Gather existing AdditionalDependencies
+        existing_dep_names = set()
+        for el in root.iter(_t("AdditionalDependencies")):
+            for part in re.split(r"[;,]", el.text or ""):
+                existing_dep_names.add(part.strip().lower())
+
+        new_dep_names = [
+            n for n in sorted(needed_lib_names)
+            if n.lower() not in existing_dep_names
+        ]
+
+        changed = False
+
+        for idg in root.iter(_t("ItemDefinitionGroup")):
+            link_el = idg.find(_t("Link"))
+            if link_el is None:
+                link_el = ET.SubElement(idg, _t("Link"))
+
+            if new_lib_rels:
+                ald = link_el.find(_t("AdditionalLibraryDirectories"))
+                if ald is None:
+                    ald = ET.SubElement(link_el, _t("AdditionalLibraryDirectories"))
+                    ald.text = ""
+                existing_text = (ald.text or "").replace(
+                    ";%(AdditionalLibraryDirectories)", ""
+                ).rstrip(";")
+                parts = [p for p in existing_text.split(";") if p.strip()]
+                for rel in new_lib_rels:
+                    norm = os.path.normpath(os.path.join(proj_dir, rel)).lower()
+                    if norm not in {os.path.normpath(os.path.join(proj_dir, p)).lower() for p in parts}:
+                        parts.append(rel)
+                ald.text = ";".join(parts) + ";%(AdditionalLibraryDirectories)"
+                changed = True
+
+            if new_dep_names:
+                ad = link_el.find(_t("AdditionalDependencies"))
+                if ad is None:
+                    ad = ET.SubElement(link_el, _t("AdditionalDependencies"))
+                    ad.text = ""
+                existing_text = (ad.text or "").replace(
+                    ";%(AdditionalDependencies)", ""
+                ).rstrip(";")
+                parts = [p for p in existing_text.split(";") if p.strip()]
+                for dep in new_dep_names:
+                    if dep not in {p.lower() for p in parts}:
+                        parts.append(dep)
+                ad.text = ";".join(parts) + ";%(AdditionalDependencies)"
+                changed = True
+
+        if changed:
+            if xmlns:
+                ET.register_namespace("", xmlns)
+            tree.write(vcxproj_path, encoding="utf-8", xml_declaration=True)
+            if new_lib_rels:
+                actions.append(f"[FIXED-LIB] {fname}: injected {len(new_lib_rels)} lib path(s) → {', '.join(new_lib_rels)}")
+            if new_dep_names:
+                actions.append(f"[FIXED-LIB] {fname}: added {len(new_dep_names)} lib(s) to AdditionalDependencies → {', '.join(new_dep_names)}")
+        else:
+            actions.append(f"[OK] {fname}: all required lib paths already present.")
+
+    return actions
+
+
+# ─────────────────────────────────────────────
+# Auto-Fix Pass 11: Precompiled Header (PCH) Auto-Stub
+# ─────────────────────────────────────────────
+
+def fix_pch(folder, last_build_output=""):
+    """
+    Handles C1010: 'unexpected end of file while looking for precompiled header'.
+
+    Strategy A — If the project has UsePrecompiledHeader=Use in its .vcxproj but
+                  the pch.h / stdafx.h file doesn't exist, creates a minimal stub.
+    Strategy B — If no PCH is configured but C1010 fires anyway, DISABLES PCH in
+                  the .vcxproj (sets PrecompiledHeader to NotUsing).
+
+    Returns a list of action strings.
+    """
+    import xml.etree.ElementTree as ET
+
+    actions = []
+
+    has_c1010 = bool(re.search(r"error C1010", last_build_output, re.IGNORECASE))
+    if not has_c1010 and last_build_output:
+        actions.append("[INFO] No C1010 errors detected — PCH looks fine.")
+        return actions
+
+    all_vcxproj = []
+    for rootdir, _, files in os.walk(folder):
+        for fname in files:
+            if fname.lower().endswith(".vcxproj"):
+                all_vcxproj.append(os.path.join(rootdir, fname))
+
+    if not all_vcxproj:
+        actions.append("[SKIP] No .vcxproj files found.")
+        return actions
+
+    for vcxproj_path in all_vcxproj:
+        proj_dir = os.path.dirname(vcxproj_path)
+        fname    = os.path.basename(vcxproj_path)
+
+        try:
+            tree = ET.parse(vcxproj_path)
+            root = tree.getroot()
+        except ET.ParseError as exc:
+            actions.append(f"[SKIP] {fname}: XML parse error — {exc}")
+            continue
+
+        ns_m  = re.match(r"^\{(.*?)\}", root.tag)
+        xmlns = ns_m.group(1) if ns_m else ""
+
+        def _t(name):
+            return f"{{{xmlns}}}{name}" if xmlns else name
+
+        changed = False
+
+        # Find PrecompiledHeader settings
+        pch_use   = None   # element with Use/Create/NotUsing
+        pch_file  = None   # element with pch header filename
+        pch_filename = "pch.h"
+
+        for idg in root.iter(_t("ItemDefinitionGroup")):
+            clc = idg.find(_t("ClCompile"))
+            if clc is not None:
+                el = clc.find(_t("PrecompiledHeader"))
+                if el is not None:
+                    pch_use = el
+                el2 = clc.find(_t("PrecompiledHeaderFile"))
+                if el2 is not None and el2.text:
+                    pch_file = el2
+                    pch_filename = el2.text.strip()
+
+        pch_abs = os.path.join(proj_dir, pch_filename)
+
+        if pch_use is not None and (pch_use.text or "").strip().lower() == "use":
+            # PCH is configured as "Use" — check if the header exists
+            if not os.path.exists(pch_abs):
+                # Create a minimal stub
+                stub_content = (
+                    "#pragma once\n"
+                    "// Auto-generated precompiled header stub by Build Doctor\n"
+                    "// Add your commonly-used headers here.\n\n"
+                    "#include <windows.h>\n"
+                    "#include <string>\n"
+                    "#include <vector>\n"
+                    "#include <memory>\n"
+                )
+                try:
+                    with open(pch_abs, "w", encoding="utf-8") as f:
+                        f.write(stub_content)
+                    actions.append(f"[FIXED-PCH] Created stub PCH file: {pch_filename}")
+                    changed = True
+                except OSError as exc:
+                    actions.append(f"[ERROR] Could not create {pch_filename}: {exc}")
+            else:
+                actions.append(f"[OK] {fname}: PCH file '{pch_filename}' already exists.")
+        elif pch_use is not None and (pch_use.text or "").strip().lower() in ("", "notusing"):
+            actions.append(f"[OK] {fname}: PCH already disabled (NotUsing).")
+        else:
+            # No PCH config at all, or C1010 fired — disable PCH globally
+            for idg in root.iter(_t("ItemDefinitionGroup")):
+                clc = idg.find(_t("ClCompile"))
+                if clc is not None:
+                    el = clc.find(_t("PrecompiledHeader"))
+                    if el is None:
+                        el = ET.SubElement(clc, _t("PrecompiledHeader"))
+                    el.text = "NotUsing"
+                    changed = True
+
+            if changed:
+                actions.append(f"[FIXED-PCH] {fname}: disabled PCH (set NotUsing on all ClCompile groups).")
+            else:
+                actions.append(f"[OK] {fname}: no PCH configuration found — no change needed.")
+
+        if changed:
+            if xmlns:
+                ET.register_namespace("", xmlns)
+            tree.write(vcxproj_path, encoding="utf-8", xml_declaration=True)
+
+    return actions
+
+
+# ─────────────────────────────────────────────
+# Auto-Fix Pass 12: ZSTD / OpenSSL / C4101 via vcpkg
+# ─────────────────────────────────────────────
+
+# Packages Build Doctor knows how to install via vcpkg
+# Maps a detection regex → vcpkg package name(s) + human label
+_VCPKG_PACKAGE_MAP = [
+    # (header/symbol pattern,  vcpkg_triplet_pkg,    display_name)
+    (r"ZSTD_decompress|zstd(?:\.h|/zstd\.h)|error C3861.*zstd",
+     "zstd:x64-windows-static", "ZSTD"),
+    (r"openssl/err\.h|openssl/ssl\.h|openssl/evp\.h|openssl/bio\.h|OPENSSL_",
+     "openssl:x64-windows-static", "OpenSSL"),
+    (r"error C1083[^']*'[^']*zstd",
+     "zstd:x64-windows-static", "ZSTD"),
+    (r"error C1083[^']*'[^']*openssl",
+     "openssl:x64-windows-static", "OpenSSL"),
+]
+
+def _find_vcpkg():
+    """
+    Locate vcpkg.exe.  Search order:
+      1. VCPKG_ROOT env var
+      2. Common install locations
+      3. PATH
+    Returns absolute path to vcpkg.exe or None.
+    """
+    # Env var set by many CI systems and the official vcpkg install guide
+    vcpkg_root = os.environ.get("VCPKG_ROOT", "")
+    if vcpkg_root:
+        candidate = os.path.join(vcpkg_root, "vcpkg.exe")
+        if os.path.isfile(candidate):
+            return candidate
+
+    # Common manual install locations
+    common_roots = []
+    for env in ("SystemDrive", "HOMEDRIVE"):
+        drive = os.environ.get(env, "C:")
+        common_roots += [
+            os.path.join(drive, os.sep, "vcpkg", "vcpkg.exe"),
+            os.path.join(drive, os.sep, "tools", "vcpkg", "vcpkg.exe"),
+            os.path.join(drive, os.sep, "src", "vcpkg", "vcpkg.exe"),
+        ]
+    for pf_env in ("ProgramFiles", "ProgramFiles(x86)"):
+        pf = os.environ.get(pf_env, "")
+        if pf:
+            common_roots.append(os.path.join(pf, "vcpkg", "vcpkg.exe"))
+
+    # Also check next to the project root (some devs vendor vcpkg in repo)
+    for candidate in common_roots:
+        if os.path.isfile(candidate):
+            return candidate
+
+    # Last resort: PATH
+    try:
+        result = subprocess.check_output(
+            ["where", "vcpkg"], text=True, stderr=subprocess.DEVNULL
+        ).strip().splitlines()
+        if result:
+            return result[0].strip()
+    except Exception:
+        pass
+
+    return None
+
+
+def _vcpkg_installed_root(vcpkg_exe):
+    """
+    Return the vcpkg installed/ directory so we can add include/lib paths.
+    Tries `vcpkg fetch` style env, then derives from executable location.
+    """
+    vcpkg_dir = os.path.dirname(vcpkg_exe)
+    installed  = os.path.join(vcpkg_dir, "installed")
+    if os.path.isdir(installed):
+        return installed
+    return None
+
+
+def _inject_vcpkg_paths(folder, vcpkg_installed_root, packages, actions):
+    """
+    After vcpkg installs packages, find their include/ and lib/ directories
+    and inject them into every .vcxproj under `folder`.
+    """
+    import xml.etree.ElementTree as ET
+
+    if not vcpkg_installed_root or not os.path.isdir(vcpkg_installed_root):
+        actions.append("[WARN] Cannot locate vcpkg installed/ directory — add paths manually.")
+        return
+
+    # Collect include dirs and lib dirs for all installed triplets
+    new_inc_dirs = set()
+    new_lib_dirs = set()
+    new_libs     = set()
+
+    for entry in os.listdir(vcpkg_installed_root):
+        triplet_dir = os.path.join(vcpkg_installed_root, entry)
+        if not os.path.isdir(triplet_dir):
+            continue
+        inc = os.path.join(triplet_dir, "include")
+        lib = os.path.join(triplet_dir, "lib")
+        if os.path.isdir(inc):
+            new_inc_dirs.add(inc)
+        if os.path.isdir(lib):
+            new_lib_dirs.add(lib)
+            # Collect .lib files for AdditionalDependencies
+            for f in os.listdir(lib):
+                if f.lower().endswith(".lib") and not f.lower().startswith("zlib"):
+                    new_libs.add(f)
+
+    if not new_inc_dirs and not new_lib_dirs:
+        actions.append("[WARN] vcpkg installed/ found but no include/lib dirs detected.")
+        return
+
+    all_vcxproj = []
+    for rootdir, _, files in os.walk(folder):
+        for fname in files:
+            if fname.lower().endswith(".vcxproj"):
+                all_vcxproj.append(os.path.join(rootdir, fname))
+
+    if not all_vcxproj:
+        actions.append("[SKIP] No .vcxproj to patch with vcpkg paths.")
+        return
+
+    for vcxproj_path in all_vcxproj:
+        proj_dir = os.path.dirname(vcxproj_path)
+        fname    = os.path.basename(vcxproj_path)
+
+        try:
+            tree = ET.parse(vcxproj_path)
+            root = tree.getroot()
+        except ET.ParseError as exc:
+            actions.append(f"[SKIP] {fname}: XML parse error — {exc}")
+            continue
+
+        ns_m  = re.match(r"^\{(.*?)\}", root.tag)
+        xmlns = ns_m.group(1) if ns_m else ""
+
+        def _t(name):
+            return f"{{{xmlns}}}{name}" if xmlns else name
+
+        changed = False
+
+        for idg in root.iter(_t("ItemDefinitionGroup")):
+            clc = idg.find(_t("ClCompile"))
+            if clc is not None:
+                aid = clc.find(_t("AdditionalIncludeDirectories"))
+                if aid is None:
+                    aid = ET.SubElement(clc, _t("AdditionalIncludeDirectories"))
+                    aid.text = "%(AdditionalIncludeDirectories)"
+
+                existing_text = (aid.text or "").replace(";%(AdditionalIncludeDirectories)", "").rstrip(";")
+                existing_norm = {
+                    os.path.normpath(p).lower()
+                    for p in existing_text.split(";") if p.strip()
+                }
+                parts = [p for p in existing_text.split(";") if p.strip()]
+                for inc in sorted(new_inc_dirs):
+                    if os.path.normpath(inc).lower() not in existing_norm:
+                        parts.append(inc)
+                        existing_norm.add(os.path.normpath(inc).lower())
+                        changed = True
+                aid.text = ";".join(parts) + ";%(AdditionalIncludeDirectories)"
+
+            link = idg.find(_t("Link"))
+            if link is not None and new_lib_dirs:
+                # AdditionalLibraryDirectories
+                ald = link.find(_t("AdditionalLibraryDirectories"))
+                if ald is None:
+                    ald = ET.SubElement(link, _t("AdditionalLibraryDirectories"))
+                    ald.text = "%(AdditionalLibraryDirectories)"
+                existing_ld = (ald.text or "").replace(";%(AdditionalLibraryDirectories)", "").rstrip(";")
+                existing_ld_norm = {
+                    os.path.normpath(p).lower()
+                    for p in existing_ld.split(";") if p.strip()
+                }
+                ld_parts = [p for p in existing_ld.split(";") if p.strip()]
+                for lib in sorted(new_lib_dirs):
+                    if os.path.normpath(lib).lower() not in existing_ld_norm:
+                        ld_parts.append(lib)
+                        existing_ld_norm.add(os.path.normpath(lib).lower())
+                        changed = True
+                ald.text = ";".join(ld_parts) + ";%(AdditionalLibraryDirectories)"
+
+                # AdditionalDependencies
+                if new_libs:
+                    ad = link.find(_t("AdditionalDependencies"))
+                    if ad is None:
+                        ad = ET.SubElement(link, _t("AdditionalDependencies"))
+                        ad.text = "%(AdditionalDependencies)"
+                    existing_ad = (ad.text or "").replace(";%(AdditionalDependencies)", "").rstrip(";")
+                    existing_ad_set = {p.lower() for p in existing_ad.split(";") if p.strip()}
+                    ad_parts = [p for p in existing_ad.split(";") if p.strip()]
+                    for lib_file in sorted(new_libs):
+                        if lib_file.lower() not in existing_ad_set:
+                            ad_parts.append(lib_file)
+                            existing_ad_set.add(lib_file.lower())
+                            changed = True
+                    ad.text = ";".join(ad_parts) + ";%(AdditionalDependencies)"
+
+        if changed:
+            if xmlns:
+                ET.register_namespace("", xmlns)
+            tree.write(vcxproj_path, encoding="utf-8", xml_declaration=True)
+            actions.append(f"[FIXED-VCPKG] {fname}: injected vcpkg include/lib paths.")
+        else:
+            actions.append(f"[OK] {fname}: vcpkg paths already present or no ClCompile/Link found.")
+
+
+def _suppress_warning_in_vcxproj(folder, warning_number, actions):
+    """
+    Add /wd<number> to DisableSpecificWarnings in every .vcxproj ClCompile block.
+    Used to auto-suppress C4101 (unreferenced local variable) which is noise.
+    """
+    import xml.etree.ElementTree as ET
+
+    all_vcxproj = []
+    for rootdir, _, files in os.walk(folder):
+        for fname in files:
+            if fname.lower().endswith(".vcxproj"):
+                all_vcxproj.append(os.path.join(rootdir, fname))
+
+    for vcxproj_path in all_vcxproj:
+        fname = os.path.basename(vcxproj_path)
+        try:
+            tree = ET.parse(vcxproj_path)
+            root = tree.getroot()
+        except ET.ParseError as exc:
+            actions.append(f"[SKIP] {fname}: XML parse error — {exc}")
+            continue
+
+        ns_m  = re.match(r"^\{(.*?)\}", root.tag)
+        xmlns = ns_m.group(1) if ns_m else ""
+
+        def _t(name):
+            return f"{{{xmlns}}}{name}" if xmlns else name
+
+        changed = False
+        for idg in root.iter(_t("ItemDefinitionGroup")):
+            clc = idg.find(_t("ClCompile"))
+            if clc is None:
+                continue
+            dsw = clc.find(_t("DisableSpecificWarnings"))
+            if dsw is None:
+                dsw = ET.SubElement(clc, _t("DisableSpecificWarnings"))
+                dsw.text = "%(DisableSpecificWarnings)"
+            existing = (dsw.text or "").replace(";%(DisableSpecificWarnings)", "").rstrip(";")
+            existing_set = {w.strip() for w in existing.split(";") if w.strip()}
+            if str(warning_number) not in existing_set:
+                parts = [w for w in existing.split(";") if w.strip()]
+                parts.append(str(warning_number))
+                dsw.text = ";".join(parts) + ";%(DisableSpecificWarnings)"
+                changed = True
+
+        if changed:
+            if xmlns:
+                ET.register_namespace("", xmlns)
+            tree.write(vcxproj_path, encoding="utf-8", xml_declaration=True)
+            actions.append(f"[FIXED-WARN] {fname}: suppressed C{warning_number} (DisableSpecificWarnings).")
+
+
+def fix_vcpkg_deps(folder, build_output=""):
+    """
+    Auto-Fix Pass 12 — ZSTD, OpenSSL, and other C3861/C1083 external deps.
+
+    Strategy:
+      1. Detect which packages are needed from build_output.
+      2. Locate or bootstrap-install vcpkg.
+      3. Run `vcpkg install <pkg>` for each missing package.
+      4. Inject the vcpkg include/ and lib/ paths into every .vcxproj.
+      5. Suppress C4101 (unreferenced local 'e') automatically.
+
+    Returns a list of action strings.
+    """
+    actions = []
+
+    # ── 0. Suppress C4101 (unreferenced local variable 'e') ──────────────────
+    if re.search(r"warning C4101", build_output, re.IGNORECASE):
+        actions.append("[*] C4101 detected — suppressing via DisableSpecificWarnings...")
+        _suppress_warning_in_vcxproj(folder, 4101, actions)
+
+    # ── 1. Determine which vcpkg packages are needed ──────────────────────────
+    packages_needed = []
+    seen_pkgs = set()
+    for pattern, pkg, label in _VCPKG_PACKAGE_MAP:
+        if re.search(pattern, build_output, re.IGNORECASE):
+            if pkg not in seen_pkgs:
+                packages_needed.append((pkg, label))
+                seen_pkgs.add(pkg)
+
+    if not packages_needed:
+        if not re.search(r"warning C4101", build_output, re.IGNORECASE):
+            actions.append("[INFO] No ZSTD/OpenSSL/vcpkg errors detected.")
+        return actions
+
+    actions.append(f"[*] Packages needed: {', '.join(label for _, label in packages_needed)}")
+
+    # ── 2. Locate vcpkg ───────────────────────────────────────────────────────
+    vcpkg_exe = _find_vcpkg()
+
+    if not vcpkg_exe:
+        # Bootstrap vcpkg into C:\vcpkg
+        vcpkg_dir = r"C:\vcpkg"
+        actions.append(f"[*] vcpkg not found — attempting to clone and bootstrap into {vcpkg_dir}...")
+        try:
+            if not os.path.isdir(vcpkg_dir):
+                rc, out = subprocess.run(
+                    ["git", "clone", "https://github.com/microsoft/vcpkg.git", vcpkg_dir],
+                    capture_output=True, text=True, timeout=300
+                ), ""
+                if hasattr(rc, "returncode"):
+                    out = (rc.stdout or "") + (rc.stderr or "")
+                    rc  = rc.returncode
+                else:
+                    rc = 0
+                if rc != 0:
+                    actions.append(f"[ERROR] git clone vcpkg failed — install vcpkg manually: https://vcpkg.io/en/getting-started")
+                    actions.append("[MANUAL] Run: git clone https://github.com/microsoft/vcpkg C:\\vcpkg && C:\\vcpkg\\bootstrap-vcpkg.bat")
+                    return actions
+                actions.append("[+] vcpkg cloned.")
+
+            bootstrap = os.path.join(vcpkg_dir, "bootstrap-vcpkg.bat")
+            if os.path.isfile(bootstrap):
+                proc = subprocess.run(
+                    [bootstrap, "-disableMetrics"],
+                    capture_output=True, text=True, timeout=120
+                )
+                if proc.returncode == 0:
+                    actions.append("[+] vcpkg bootstrapped successfully.")
+                else:
+                    actions.append(f"[WARN] bootstrap-vcpkg.bat exited {proc.returncode} — may still work.")
+
+            vcpkg_exe = os.path.join(vcpkg_dir, "vcpkg.exe")
+            if not os.path.isfile(vcpkg_exe):
+                actions.append("[ERROR] vcpkg.exe not found after bootstrap. Install manually.")
+                actions.append("[MANUAL] https://vcpkg.io/en/getting-started")
+                return actions
+        except Exception as exc:
+            actions.append(f"[ERROR] vcpkg bootstrap failed: {exc}")
+            actions.append("[MANUAL] Install vcpkg: https://vcpkg.io/en/getting-started")
+            actions.append("[MANUAL] Then run: vcpkg install zstd:x64-windows-static openssl:x64-windows-static")
+            return actions
+
+    actions.append(f"[INFO] Using vcpkg at: {vcpkg_exe}")
+
+    # ── 3. Install each package ───────────────────────────────────────────────
+    for pkg, label in packages_needed:
+        actions.append(f"[*] Installing {label} via vcpkg ({pkg})...")
+        try:
+            proc = subprocess.run(
+                [vcpkg_exe, "install", pkg, "--recurse"],
+                capture_output=True, text=True,
+                encoding="utf-8", errors="ignore",
+                timeout=600
+            )
+            output = (proc.stdout or "") + (proc.stderr or "")
+            for line in output.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                lo = line.lower()
+                if "error" in lo or "fail" in lo:
+                    actions.append(f"  [ERR] {line}")
+                elif "already installed" in lo or "up-to-date" in lo:
+                    actions.append(f"  [OK] {label} already installed.")
+                elif "installing" in lo or "succeed" in lo or "package" in lo:
+                    actions.append(f"  [+] {line}")
+
+            if proc.returncode == 0:
+                actions.append(f"[FIXED-VCPKG] {label} installed successfully.")
+            else:
+                actions.append(f"[WARN] vcpkg install {pkg} exited {proc.returncode} — check output above.")
+        except subprocess.TimeoutExpired:
+            actions.append(f"[ERROR] vcpkg install {label} timed out (>10 min) — run manually:")
+            actions.append(f"[MANUAL] {vcpkg_exe} install {pkg}")
+        except Exception as exc:
+            actions.append(f"[ERROR] vcpkg install {label} failed: {exc}")
+
+    # ── 4. Inject vcpkg include/lib paths into .vcxproj ──────────────────────
+    installed_root = _vcpkg_installed_root(vcpkg_exe)
+    if installed_root:
+        actions.append(f"[*] Injecting vcpkg paths from: {installed_root}")
+        _inject_vcpkg_paths(folder, installed_root, packages_needed, actions)
+    else:
+        actions.append("[WARN] Could not locate vcpkg installed/ root — add include/lib paths manually.")
+        vcpkg_dir = os.path.dirname(vcpkg_exe)
+        actions.append(f"[MANUAL] Add to AdditionalIncludeDirectories: {vcpkg_dir}\\installed\\x64-windows-static\\include")
+        actions.append(f"[MANUAL] Add to AdditionalLibraryDirectories: {vcpkg_dir}\\installed\\x64-windows-static\\lib")
+
+    return actions
+
+
+# ─────────────────────────────────────────────
+# Auto-Fix Loop Orchestrator
+# ─────────────────────────────────────────────
+
+# Maps error patterns → which fix functions to call automatically
+_AUTO_FIX_RULES = [
+    # (regex_pattern,  fix_function,   needs_build_output, label)
+    # C4101 + ZSTD + OpenSSL: run BEFORE generic C1083/LNK passes
+    (r"warning C4101|ZSTD_decompress|error C3861.*zstd"
+     r"|error C1083[^']*(?:zstd|openssl)|OPENSSL_|openssl/",
+                                       "fix_vcpkg_deps",    True,  "FIX DEPS (vcpkg)"),
+    (r"error C1083",                   "fix_cpp_includes",  True,  "FIX INCS"),
+    (r"error C1010",                   "fix_pch",           True,  "FIX PCH"),
+    (r"LNK2001|LNK2019|LNK1181|LNK1104|LNK1120", "fix_missing_libs", True, "FIX LIBS"),
+    (r"error CS2001|error CS0246",     "fix_cs_files",      False, "FIX CS FILES"),
+    (r"error CS0006|NU1101|NU1102|NU1103|packages\.config.*not found",
+                                       "fix_dotnet_restore",False, "NUGET RESTORE"),
+    (r"C4003.*LUAU_FASTFLAGVARIABLE|C2051.*BytecodeUtils|LuauBytecodeType.*undeclared"
+     r"|error C1083[^']*'[^']*(?:Luau/|luau/|lua\.h|luaconf\.h|lualib\.h)",
+                                       "fix_luau",          True,  "FIX LUAU"),
+]
+
+_FIX_FUNC_MAP = {
+    "fix_vcpkg_deps":    lambda folder, out: fix_vcpkg_deps(folder, out),
+    "fix_cpp_includes":  lambda folder, out: fix_cpp_missing_includes(folder, out),
+    "fix_pch":           lambda folder, out: fix_pch(folder, out),
+    "fix_missing_libs":  lambda folder, out: fix_missing_libs(folder, out),
+    "fix_cs_files":      lambda folder, out: fix_missing_cs_files(folder),
+    "fix_dotnet_restore":lambda folder, out: _run_dotnet_restore_cmd(folder).get("output", "").splitlines(),
+    "fix_luau":          lambda folder, out: fix_luau_submodule(folder, last_build_output=out),
+}
+
+
+def auto_fix_from_output(folder, build_output, emit_line=None):
+    """
+    Given build output, automatically determines which fix passes apply
+    and runs them. Returns (actions_list, fix_labels_applied).
+    """
+    actions_all   = []
+    labels_applied = []
+
+    def log(text, cls="dim"):
+        actions_all.append(text)
+        if emit_line:
+            emit_line(text, cls)
+
+    for pattern, func_name, needs_output, label in _AUTO_FIX_RULES:
+        if re.search(pattern, build_output, re.IGNORECASE):
+            log(f"[AUTO-FIX] Detected pattern → running {label}...", "warn")
+            try:
+                out_arg = build_output if needs_output else ""
+                fix_results = _FIX_FUNC_MAP[func_name](folder, out_arg)
+                for line in fix_results:
+                    cls = "info"  if line.startswith("[FIXED") else \
+                          "error" if line.startswith("[ERROR") else \
+                          "warn"  if line.startswith("[WARN")  else "dim"
+                    log(line, cls)
+                labels_applied.append(label)
+            except Exception as exc:
+                log(f"[ERROR] {label} threw: {exc}", "error")
+
+    if not labels_applied:
+        log("[AUTO-FIX] No auto-applicable fixes matched this build output.", "dim")
+
+    return actions_all, labels_applied
+
+
+# ─────────────────────────────────────────────
+# Build Output SHA256 Hash
+# ─────────────────────────────────────────────
+
+def sha256_file(path):
+    """Returns hex SHA256 of a file, or None on error."""
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────
 # Diagnosis
 # ─────────────────────────────────────────────
 
@@ -1898,6 +2897,16 @@ class Api:
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)})
 
+    # ── fix_vcxproj_items (pass 9 — missing ClCompile / ClInclude) ──────────
+    def fix_vcxproj_items(self, folder):
+        if not os.path.isdir(folder):
+            return json.dumps({"ok": False, "error": "Folder not found"})
+        try:
+            actions = fix_vcxproj_missing_items(folder)
+            return json.dumps({"ok": True, "actions": actions})
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)})
+
     # ── fix_cpp_includes (pass 6 — C1083 missing include dirs) ──────────────
     def fix_cpp_includes(self, folder, build_output=""):
         if not os.path.isdir(folder):
@@ -1923,7 +2932,166 @@ class Api:
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)})
 
-    # ── run_dotnet_restore ────────────────────────────────────────────────────
+    # ── fix_missing_libs (pass 10 — LNK lib finder) ─────────────────────────
+    def fix_missing_libs(self, folder):
+        if not os.path.isdir(folder):
+            return json.dumps({"ok": False, "error": "Folder not found"})
+        try:
+            actions = fix_missing_libs(folder, self._last_output)
+            return json.dumps({"ok": True, "actions": actions})
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)})
+
+    # ── fix_pch (pass 11 — PCH auto-stub / disable) ──────────────────────────
+    def fix_pch(self, folder):
+        if not os.path.isdir(folder):
+            return json.dumps({"ok": False, "error": "Folder not found"})
+        try:
+            actions = fix_pch(folder, self._last_output)
+            return json.dumps({"ok": True, "actions": actions})
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)})
+
+    # ── fix_vcpkg_deps (pass 12 — ZSTD / OpenSSL / C4101) ───────────────────
+    def fix_vcpkg_deps(self, folder):
+        if not os.path.isdir(folder):
+            return json.dumps({"ok": False, "error": "Folder not found"})
+        try:
+            actions = fix_vcpkg_deps(folder, self._last_output)
+            return json.dumps({"ok": True, "actions": actions})
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)})
+
+    # ── auto_fix_loop ─────────────────────────────────────────────────────────
+    def auto_fix_loop(self, folder, config_json, max_retries=3):
+        """
+        Run build → if failed, auto-detect and apply fixes → retry.
+        Streams live via JS events. max_retries caps the loop.
+        """
+        def _run():
+            config = json.loads(config_json)
+
+            for attempt in range(1, max_retries + 2):
+                self._emit("log", {"text": f"", "cls": "dim"})
+                self._emit("log", {
+                    "text": f"═══ AUTO-FIX LOOP — Attempt {attempt}/{max_retries + 1} ═══",
+                    "cls": "heading"
+                })
+
+                # ── Build ──────────────────────────────────────────────────────
+                try:
+                    bat_path, _ = generate_build_bat(folder, config)
+                    self._emit("log", {"text": "[+] build.bat generated.", "cls": "info"})
+                except Exception as exc:
+                    self._emit("log", {"text": f"[!] {exc}", "cls": "error"})
+                    self._emit("autofix_done", {"success": False, "attempts": attempt,
+                                                "diag": [str(exc)], "exePath": ""})
+                    return
+
+                captured = ""
+                proc = subprocess.Popen(
+                    ["cmd.exe", "/c", bat_path],
+                    cwd=folder,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                )
+                for line in proc.stdout:
+                    stripped  = line.rstrip()
+                    captured += stripped + "\n"
+                    lo = stripped.lower()
+                    if any(x in lo for x in ["error", "fatal", "failed"]):
+                        cls = "error"
+                    elif "warning" in lo:
+                        cls = "warn"
+                    elif any(x in lo for x in ["succeeded", "->", "build complete"]):
+                        cls = "info"
+                    else:
+                        cls = "default"
+                    self._emit("log", {"text": stripped, "cls": cls})
+
+                proc.wait()
+                self._last_output = captured
+                success = proc.returncode == 0
+
+                if success:
+                    # ── Find EXE ──────────────────────────────────────────────
+                    exe_path = ""
+                    conf      = config.get("config", "Release")
+                    proj_name = os.path.basename(folder.rstrip("\\/")) or "project"
+                    candidates = [
+                        os.path.join(folder, "x64", conf, f"{proj_name}.exe"),
+                        os.path.join(folder, conf, f"{proj_name}.exe"),
+                        os.path.join(folder, f"{proj_name}.exe"),
+                    ]
+                    arrow_m = re.search(r"->\s+(.+\.exe)", captured, re.IGNORECASE)
+                    if arrow_m:
+                        ap = arrow_m.group(1).strip()
+                        if not os.path.isabs(ap):
+                            ap = os.path.join(folder, ap)
+                        candidates.insert(0, ap)
+                    for c in candidates:
+                        if os.path.isfile(c):
+                            exe_path = c
+                            break
+
+                    # ── SHA256 fingerprint ────────────────────────────────────
+                    if exe_path:
+                        h = sha256_file(exe_path)
+                        if h:
+                            self._emit("log", {
+                                "text": f"[SHA256] {os.path.basename(exe_path)} → {h}",
+                                "cls": "dim"
+                            })
+
+                    self._emit("autofix_done", {
+                        "success":  True,
+                        "attempts": attempt,
+                        "diag":     diagnose(captured),
+                        "exePath":  exe_path,
+                        "sha256":   sha256_file(exe_path) if exe_path else "",
+                    })
+                    return
+
+                # ── Build failed — attempt auto-fix before retrying ────────────
+                if attempt <= max_retries:
+                    self._emit("log", {"text": "", "cls": "dim"})
+                    self._emit("log", {
+                        "text": f"[AUTO-FIX] Build failed — analyzing errors and applying fixes...",
+                        "cls": "warn"
+                    })
+                    fix_actions, labels = auto_fix_from_output(
+                        folder, captured,
+                        emit_line=lambda t, c: self._emit("log", {"text": t, "cls": c})
+                    )
+                    if not labels:
+                        self._emit("log", {
+                            "text": "[AUTO-FIX] No applicable auto-fix found — stopping loop.",
+                            "cls": "error"
+                        })
+                        break
+                    self._emit("log", {
+                        "text": f"[AUTO-FIX] Applied: {', '.join(labels)} — retrying build...",
+                        "cls": "info"
+                    })
+                else:
+                    break
+
+            # Loop exhausted without success
+            self._emit("autofix_done", {
+                "success":  False,
+                "attempts": min(attempt, max_retries + 1),
+                "diag":     diagnose(self._last_output),
+                "exePath":  "",
+                "sha256":   "",
+            })
+
+        threading.Thread(target=_run, daemon=True).start()
+        return json.dumps({"ok": True})
+
+
     def run_dotnet_restore(self, folder):
         if not os.path.isdir(folder):
             return json.dumps({"ok": False, "output": "Folder not found", "returncode": -1})
@@ -2030,6 +3198,12 @@ class Api:
 
                 if exe_path:
                     self._emit("log", {"text": f"[OK] Output EXE: {exe_path}", "cls": "info"})
+                    h = sha256_file(exe_path)
+                    if h:
+                        self._emit("log", {
+                            "text": f"[SHA256] {os.path.basename(exe_path)} → {h}",
+                            "cls": "dim"
+                        })
                 else:
                     self._emit("log", {"text": "[?] Build succeeded but .exe location unknown.", "cls": "warn"})
 
@@ -2060,8 +3234,11 @@ class Api:
                 "returncode": proc.returncode,
                 "diag":       fixes,
                 "exePath":    exe_path,
+                "sha256":     sha256_file(exe_path) if exe_path else "",
                 "hasC1083":   bool(re.search(r"error C1083", captured, re.IGNORECASE)),
                 "hasLuau":    _has_luau,
+                "hasLnk":     bool(re.search(r"LNK2001|LNK2019|LNK1181|LNK1104|LNK1120", captured, re.IGNORECASE)),
+                "hasPch":     bool(re.search(r"error C1010", captured, re.IGNORECASE)),
             })
 
         threading.Thread(target=_run, daemon=True).start()
@@ -2303,7 +3480,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14
   <div class="tb-dot dot-g"></div>
   <span class="tb-name">BUILD DOCTOR</span>
   <span class="tb-badge">MSVC</span>
-  <span class="tb-version">v3.0</span>
+  <span class="tb-version">v9.0</span>
 </div>
 
 <div class="main">
@@ -2390,9 +3567,39 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14
         </svg>
         Fix Header Guards
       </div>
-    </div>
+      <div class="sb-item sb-fix" onclick="doFixVcxproj()" title="Sync .vcxproj: add missing ClCompile/ClInclude for disk files, remove dead entries">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+          <polyline points="14 2 14 8 20 8"/>
+          <line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/>
+        </svg>
+        Sync .vcxproj Items
+      </div>
+      <div class="sb-item sb-fix" onclick="doFixLibs()" title="Pass 10: Find missing .lib files and inject into vcxproj linker">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
+        </svg>
+        Fix Missing .libs
+      </div>
+      <div class="sb-item sb-fix" onclick="doFixPch()" title="Pass 11: Create PCH stub or disable precompiled headers">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/>
+          <polyline points="13 2 13 9 20 9"/>
+        </svg>
+        Fix PCH
+      </div>
 
-    <div class="status-area">
+    <div class="sb-section">
+      <div class="sb-label">AUTOMATION</div>
+      <div class="sb-item" style="color:var(--accent)" onclick="doAutoFixLoop()" title="Build → auto-detect errors → fix → retry (up to 3x)">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="1 4 1 10 7 10"/>
+          <polyline points="23 20 23 14 17 14"/>
+          <path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4-4.64 4.36A9 9 0 0 1 3.51 15"/>
+        </svg>
+        Auto-Fix Loop
+      </div>
+    </div>
       <span class="sdot idle" id="sdot"></span>
       <span class="stext" id="stext">IDLE</span>
     </div>
@@ -2410,8 +3617,12 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14
       <button class="btn btn-warn" onclick="doFixDupes()" title="Remove duplicate refs + empty ItemGroups">FIX DUPES</button>
       <button class="btn btn-warn" onclick="doFixHeaders()" title="Add #pragma once to unguarded headers">FIX HDRS</button>
       <button class="btn btn-warn" onclick="doFixIncludes()" title="Fix C1083: find missing headers and inject include paths into .vcxproj">FIX INCS</button>
+      <button class="btn btn-warn" onclick="doFixVcxproj()" title="Auto-sync .vcxproj: add missing ClCompile/ClInclude entries for files on disk, remove dead ones">FIX VCXPROJ</button>
       <button class="btn btn-warn" onclick="doFixLuau()" title="Fix Luau C1083: init submodule or clone luau-lang/luau, then patch .vcxproj">FIX LUAU</button>
+      <button class="btn btn-warn" onclick="doFixLibs()" title="Pass 10: Find missing .lib files and inject into .vcxproj linker paths">FIX LIBS</button>
+      <button class="btn btn-warn" onclick="doFixPch()" title="Pass 11: Create a PCH stub or disable precompiled headers">FIX PCH</button>
       <button class="btn btn-purple" onclick="doFixAll()" title="Run all C# fix passes">FIX ALL</button>
+      <button class="btn" style="border-color:var(--accent);color:var(--accent)" onclick="doAutoFixLoop()" title="Build → auto-detect errors → apply fixes → retry (up to 3 times)">&#9654;&#9654; AUTO-FIX</button>
       <button class="btn btn-primary" id="runBtn" onclick="doRunBuild()">&#9654; RUN BUILD</button>
     </div>
 
@@ -2521,8 +3732,9 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14
 <script>
 // ── Event bridge from Python ─────────────────────
 window.__bdEvent = function(event, data) {
-  if (event === 'log')  appendLine(data.text, data.cls);
-  if (event === 'done') onBuildDone(data);
+  if (event === 'log')         appendLine(data.text, data.cls);
+  if (event === 'done')        onBuildDone(data);
+  if (event === 'autofix_done') onAutoFixDone(data);
 };
 
 // ── State ────────────────────────────────────────
@@ -2781,6 +3993,34 @@ async function doFixHeaders() {
   setStatus('idle');
 }
 
+async function doFixVcxproj() {
+  const folder = document.getElementById('pathInput').value.trim();
+  if (!folder) { appendLine('[!] Enter a project path first.', 'error'); return; }
+  setStatus('fixing');
+  clearLog();
+  appendLine('[*] Pass 9: syncing .vcxproj item lists against files on disk...', 'info');
+  appendLine('[~] Adds missing <ClCompile> / <ClInclude> entries, removes dead ones.', 'dim');
+  appendLine('', 'dim');
+  const res = JSON.parse(await window.pywebview.api.fix_vcxproj_items(folder));
+  if (!res.ok) { appendLine('[!] ' + res.error, 'error'); setStatus('idle'); return; }
+  renderFixActions(res.actions);
+  const added = res.actions.filter(l => l.startsWith('[FIXED-ADD]')).length;
+  const dead  = res.actions.filter(l => l.startsWith('[FIXED-DEAD]')).length;
+  const skipped = res.actions.filter(l => l.startsWith('[SKIP]')).length;
+  appendLine('', 'dim');
+  if (added > 0 || dead > 0) {
+    const parts = [];
+    if (added > 0) parts.push(`added ${added} missing entry/entries`);
+    if (dead  > 0) parts.push(`removed ${dead} dead entry/entries`);
+    appendLine(`[+] .vcxproj synced: ${parts.join(', ')}. Re-run your build now.`, 'info');
+  } else if (skipped > 0) {
+    appendLine('[!] No .vcxproj files found — check your project path.', 'warn');
+  } else {
+    appendLine('[+] All .vcxproj item references are already in sync with disk.', 'dim');
+  }
+  setStatus('idle');
+}
+
 async function doFixIncludes() {
   const folder = document.getElementById('pathInput').value.trim();
   if (!folder) { appendLine('[!] Enter a project path first.', 'error'); return; }
@@ -2905,6 +4145,7 @@ function onBuildDone(data) {
     appendLine('', 'dim');
     appendLine('\u2714 BUILD SUCCEEDED', 'info');
     appendLine('\u2192 EXE: ' + data.exePath, 'info');
+    if (data.sha256) appendLine('[SHA256] ' + data.sha256, 'dim');
   } else if (data.success) {
     appendLine('', 'dim');
     appendLine('\u2714 BUILD SUCCEEDED (check project output folder for .exe)', 'info');
@@ -2917,6 +4158,19 @@ function onBuildDone(data) {
     appendLine('', 'dim');
     appendLine('[!] C1083 detected — click FIX INCS to auto-patch include paths in your .vcxproj.', 'warn');
   }
+  if (data.hasLnk) {
+    appendLine('', 'dim');
+    appendLine('[!] LNK errors detected — click FIX LIBS to auto-find and inject missing .lib paths.', 'warn');
+  }
+  if (data.hasPch) {
+    appendLine('', 'dim');
+    appendLine('[!] C1010 detected — click FIX PCH to create a PCH stub or disable precompiled headers.', 'warn');
+  }
+
+  if (!data.success) {
+    appendLine('', 'dim');
+    appendLine('[TIP] Click \u25b6\u25b6 AUTO-FIX to automatically detect errors and retry the build.', 'dim');
+  }
 
   renderDiag(data.diag, data.success);
   if (!diagOpen) toggleDiag();
@@ -2925,6 +4179,95 @@ function onBuildDone(data) {
   isBuilding = false;
   runBtn.disabled   = false;
   runBtn.textContent = '\u25B6 RUN BUILD';
+}
+
+function onAutoFixDone(data) {
+  const elapsed = ((Date.now() - buildStart) / 1000).toFixed(2);
+  buildTime.textContent = elapsed + 's';
+
+  appendLine('', 'dim');
+  appendLine('═══ AUTO-FIX LOOP COMPLETE ═══', 'heading');
+  if (data.success) {
+    appendLine(`\u2714 BUILD SUCCEEDED after ${data.attempts} attempt(s).`, 'info');
+    if (data.exePath) appendLine('\u2192 EXE: ' + data.exePath, 'info');
+    if (data.sha256)  appendLine('[SHA256] ' + data.sha256, 'dim');
+  } else {
+    appendLine(`\u2716 BUILD FAILED after ${data.attempts} attempt(s) — manual intervention needed.`, 'error');
+    appendLine('[TIP] Check the output above for unfixed errors, or use individual FIX buttons.', 'warn');
+  }
+
+  data.diag.forEach(msg => appendLine('[+] ' + msg, data.success ? 'info' : 'warn'));
+
+  renderDiag(data.diag, data.success);
+  if (!diagOpen) toggleDiag();
+
+  setStatus(data.success ? 'ok' : 'err');
+  isBuilding = false;
+  runBtn.disabled   = false;
+  runBtn.textContent = '\u25B6 RUN BUILD';
+}
+
+async function doFixLibs() {
+  const folder = document.getElementById('pathInput').value.trim();
+  if (!folder) { appendLine('[!] Enter a project path first.', 'error'); return; }
+  setStatus('fixing');
+  clearLog();
+  appendLine('[*] Pass 10: scanning for missing .lib files (LNK errors)...', 'info');
+  appendLine('[~] Will search project tree and SDK paths for matching .lib files.', 'dim');
+  appendLine('', 'dim');
+  const res = JSON.parse(await window.pywebview.api.fix_missing_libs(folder));
+  if (!res.ok) { appendLine('[!] ' + res.error, 'error'); setStatus('idle'); return; }
+  renderFixActions(res.actions);
+  const fixed  = res.actions.filter(l => l.startsWith('[FIXED-LIB]')).length;
+  const warned = res.actions.filter(l => l.startsWith('[WARN]')).length;
+  appendLine('', 'dim');
+  if (fixed > 0) {
+    appendLine(`[+] Patched ${fixed} .vcxproj entry/entries with lib paths. Re-run build now.`, 'info');
+  } else if (warned > 0) {
+    appendLine('[!] Some .lib files could not be found — add them manually or install the dependency.', 'warn');
+  } else {
+    appendLine('[+] All required lib paths already present.', 'dim');
+  }
+  setStatus('idle');
+}
+
+async function doFixPch() {
+  const folder = document.getElementById('pathInput').value.trim();
+  if (!folder) { appendLine('[!] Enter a project path first.', 'error'); return; }
+  setStatus('fixing');
+  clearLog();
+  appendLine('[*] Pass 11: checking precompiled header (PCH) configuration...', 'info');
+  const res = JSON.parse(await window.pywebview.api.fix_pch(folder));
+  if (!res.ok) { appendLine('[!] ' + res.error, 'error'); setStatus('idle'); return; }
+  renderFixActions(res.actions);
+  const fixed  = res.actions.filter(l => l.startsWith('[FIXED-PCH]')).length;
+  appendLine('', 'dim');
+  appendLine(fixed > 0
+    ? `[+] PCH fixed: ${fixed} action(s) taken. Re-run build now.`
+    : '[+] PCH configuration looks fine.', fixed > 0 ? 'info' : 'dim');
+  setStatus('idle');
+}
+
+async function doAutoFixLoop() {
+  if (isBuilding) return;
+  const folder = document.getElementById('pathInput').value.trim();
+  if (!folder) { appendLine('[!] Enter a project path first.', 'error'); return; }
+
+  isBuilding = true;
+  runBtn.disabled   = true;
+  runBtn.textContent = '\u23F3 BUILDING';
+  setStatus('building');
+  clearLog();
+  diagBody.innerHTML = '';
+  buildTime.textContent = '';
+  buildStart = Date.now();
+
+  appendLine('[*] AUTO-FIX LOOP started — will build, detect errors, fix, and retry.', 'info');
+  appendLine('[~] Max 3 fix+retry attempts before giving up.', 'dim');
+  appendLine('', 'dim');
+
+  const config = getConfig();
+  await window.pywebview.api.auto_fix_loop(folder, JSON.stringify(config), 3);
 }
 
 function doClear() {
@@ -2959,4 +4302,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+  main()
